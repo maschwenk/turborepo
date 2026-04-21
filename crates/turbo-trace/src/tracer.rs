@@ -337,6 +337,36 @@ impl Tracer {
             .with_main_field("types")
             .with_condition_names(&["import", "require", "node", "types", "default"]);
 
+        // Mirror TypeScript's `moduleResolution: "nodenext"` / `"bundler"`
+        // behavior: when the source writes `import ... from "./foo.js"` (as
+        // required by ESM), the actual on-disk file is `./foo.ts`. Without
+        // these aliases the resolver returns `NotFound` for every
+        // explicit-extension import in an ESM TypeScript project, causing
+        // tsconfig `paths` aliases to fall through to
+        // `check_package_import` and be flagged as undeclared dependencies.
+        //
+        // Matches webpack's `resolve.extensionAlias` convention.
+        options.extension_alias = vec![
+            (
+                ".js".to_string(),
+                vec![
+                    ".ts".to_string(),
+                    ".tsx".to_string(),
+                    ".d.ts".to_string(),
+                    ".js".to_string(),
+                    ".jsx".to_string(),
+                ],
+            ),
+            (
+                ".mjs".to_string(),
+                vec![".mts".to_string(), ".mjs".to_string()],
+            ),
+            (
+                ".cjs".to_string(),
+                vec![".cts".to_string(), ".cjs".to_string()],
+            ),
+        ];
+
         if let Some(ts_config) = ts_config {
             options.tsconfig = Some(TsconfigOptions {
                 config_file: ts_config.as_std_path().into(),
