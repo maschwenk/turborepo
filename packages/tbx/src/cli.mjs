@@ -33,6 +33,9 @@ const defaults = {
   vcpus: "32"
 };
 
+const interactiveShellPath = "/tmp/tbx-interactive-shell";
+const signingShimPath = "/tmp/tbx-signing-shim";
+
 const userProfiles = {
   "anthony-shew": {
     dotfiles: {
@@ -53,7 +56,8 @@ Commands:
   creds github <name>   Apply credential brokering to a PR sandbox
   creds check <name>    Verify brokered auth in a PR sandbox
   new <name>            Create a PR sandbox from the latest base snapshot
-  sh <name>             Connect to a PR sandbox
+  sh|ssh [--repair] <name>
+                        Connect to a PR sandbox
   run <name> -- <cmd>   Run a command in a PR sandbox
   stop <name>           Stop a PR sandbox session
   rm <name>             Permanently remove a PR sandbox
@@ -110,7 +114,9 @@ function loadPackageEnv() {
 }
 
 function sandboxEnv() {
-  return process.env;
+  const env = { ...process.env };
+  delete env.VERCEL_OIDC_TOKEN;
+  return env;
 }
 
 function sandboxArgs(args) {
@@ -153,6 +159,51 @@ function runAsync(command, args, options = {}) {
       resolvePromise({ status });
     });
   });
+}
+
+function readHostTerminalState() {
+  if (!process.stdin.isTTY) {
+    return null;
+  }
+
+  const result = spawnSync("stty", ["-g"], {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: ["inherit", "pipe", "ignore"],
+    encoding: "utf8"
+  });
+
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
+function restoreHostTerminal(state) {
+  if (!process.stdin.isTTY) {
+    return;
+  }
+
+  if (state) {
+    spawnSync("stty", [state], {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: ["inherit", "ignore", "ignore"]
+    });
+  } else {
+    spawnSync("stty", ["sane"], {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: ["inherit", "ignore", "ignore"]
+    });
+  }
+
+  try {
+    process.stdin.setRawMode?.(false);
+  } catch {
+    // The Sandbox CLI may destroy stdin during cleanup after a dropped pty.
+  }
+
+  process.stderr.write(
+    "\u001B[?25h\u001B[?1049l\u001B[?1000l\u001B[?1002l\u001B[?1003l\u001B[?1006l\u001B[?2004l"
+  );
 }
 
 function sandbox(args, options = {}) {
@@ -211,6 +262,41 @@ function taskBranchName(name) {
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function interactiveShellCommand() {
+  return `
+tbx_keepalive() {
+  parent_pid="$$"
+  while sleep 20; do
+    if ! kill -0 "$parent_pid" 2>/dev/null; then
+      exit 0
+    fi
+    shell_pgid="$(ps -o pgid= -p "$parent_pid" 2>/dev/null | tr -d ' ')"
+    tty_pgid="$(ps -o tpgid= -p "$parent_pid" 2>/dev/null | tr -d ' ')"
+    if [ -n "$shell_pgid" ] && [ "$shell_pgid" = "$tty_pgid" ]; then
+      printf '\\033[?25h' > /dev/tty
+    fi
+  done
+}
+
+tbx_keepalive &
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+if command -v zsh >/dev/null 2>&1 && [ -r "$HOME/.zshrc" ]; then
+  exec env -u PS1 -u PROMPT zsh -l
+fi
+exec bash -l
+`;
+}
+
+async function writeInteractiveShellCommand(sandboxName) {
+  const target = await Sandbox.get({ name: sandboxName });
+  await target.writeFiles([
+    {
+      path: interactiveShellPath,
+      content: interactiveShellCommand()
+    }
+  ]);
 }
 
 function latestSnapshot(config) {
@@ -548,20 +634,6 @@ function hasHostVercelOidcToken() {
   }
 }
 
-function brokeredVercelOidcToken() {
-  const token = maybeHostVercelOidcToken();
-  if (!token) {
-    return null;
-  }
-
-  const parts = token.split(".");
-  if (parts.length !== 3 || !parts[0] || !parts[1]) {
-    return "tbx-brokered";
-  }
-
-  return `${parts[0]}.${parts[1]}.tbx-brokered`;
-}
-
 function vercelCredentialPolicy() {
   const token = maybeHostVercelOidcToken();
   if (!token) {
@@ -640,9 +712,8 @@ function brokeredCredentialEnvArgs() {
   requireBrokeredCredentials();
 
   const args = brokeredGitHubEnvArgs();
-  const token = brokeredVercelOidcToken();
-  if (token) {
-    args.push("--env", `VERCEL_OIDC_TOKEN=${token}`);
+  if (maybeHostVercelOidcToken()) {
+    args.push("--env", "VERCEL_OIDC_TOKEN=tbx-brokered");
     args.push("--env", "AI_GATEWAY_API_KEY=tbx-brokered");
   }
   return args;
@@ -732,10 +803,21 @@ git -C ${shellQuote(config.repoPath)} config commit.gpgsign true
 `;
 }
 
-function ensureSigningShim(config, sandboxName, publicKey) {
+async function writeSigningShimCommand(config, sandboxName, publicKey) {
+  const target = await Sandbox.get({ name: sandboxName });
+  await target.writeFiles([
+    {
+      path: signingShimPath,
+      content: signingShimCommand(config, publicKey)
+    }
+  ]);
+}
+
+async function ensureSigningShim(config, sandboxName, publicKey) {
   console.log(
     `[tbx] configuring host-backed commit signing for ${sandboxName}`
   );
+  await writeSigningShimCommand(config, sandboxName, publicKey);
   sandbox([
     "exec",
     "--workdir",
@@ -743,8 +825,7 @@ function ensureSigningShim(config, sandboxName, publicKey) {
     ...brokeredCredentialEnvArgs(),
     sandboxName,
     "bash",
-    "-lc",
-    signingShimCommand(config, publicKey)
+    signingShimPath
   ]);
 }
 
@@ -950,47 +1031,70 @@ async function createTask(name, publicKey = hostSigningPublicKey()) {
     "-lc",
     command
   ]);
-  ensureSigningShim(config, sandboxName, publicKey);
+  await ensureSigningShim(config, sandboxName, publicKey);
+  await writeInteractiveShellCommand(sandboxName);
 }
 
-async function ensureTaskSandbox(
-  config,
-  name,
-  publicKey = hostSigningPublicKey()
-) {
+async function ensureTaskSandbox(config, name, publicKey, options = {}) {
   const sandboxName = taskSandboxName(config, name);
   if (!sandboxExists(sandboxName)) {
     console.log(
       `[tbx] ${sandboxName} does not exist; creating from base snapshot`
     );
-    await createTask(name, publicKey);
-  } else {
+    await createTask(name, publicKey ?? hostSigningPublicKey());
+  } else if (options.repair ?? true) {
+    const signingPublicKey = publicKey ?? hostSigningPublicKey();
     await applyGitHubCredentialBroker(config, name);
-    ensureSigningShim(config, sandboxName, publicKey);
+    await ensureSigningShim(config, sandboxName, signingPublicKey);
+    await writeInteractiveShellCommand(sandboxName);
   }
   return sandboxName;
 }
 
-async function shell(name) {
+function parseShellArgs(args) {
+  const repair = args.includes("--repair");
+  const names = args.filter((arg) => arg !== "--repair");
+
+  if (names.length !== 1) {
+    console.error("Usage: pnpm tbx sh [--repair] <name>");
+    process.exit(1);
+  }
+
+  return { name: names[0], repair };
+}
+
+async function shell(args) {
+  const { name, repair } = parseShellArgs(args);
   const config = readConfig();
   requireSandboxInstalled();
-  const publicKey = hostSigningPublicKey();
-  const sandboxName = await ensureTaskSandbox(config, name, publicKey);
+  const sandboxName = await ensureTaskSandbox(config, name, undefined, {
+    repair
+  });
   const broker = await startSigningBroker(sandboxName);
+  const terminalState = readHostTerminalState();
+  let status = 0;
   try {
-    await sandboxAsync([
-      "exec",
-      "--interactive",
-      "--tty",
-      "--workdir",
-      config.repoPath,
-      ...brokeredCredentialEnvArgs(),
-      sandboxName,
-      "bash",
-      "-l"
-    ]);
+    const result = await sandboxAsync(
+      [
+        "exec",
+        "--interactive",
+        "--tty",
+        "--workdir",
+        config.repoPath,
+        ...brokeredCredentialEnvArgs(),
+        sandboxName,
+        "bash",
+        interactiveShellPath
+      ],
+      { allowFailure: true }
+    );
+    status = result.status ?? 0;
   } finally {
+    restoreHostTerminal(terminalState);
     broker.close();
+  }
+  if (status !== 0) {
+    process.exit(status);
   }
 }
 
@@ -1238,8 +1342,8 @@ async function main() {
       await checkGitHubCredentialBroker(args[1]);
     } else if (command === "new") {
       await createTask(args[0]);
-    } else if (command === "sh") {
-      await shell(args[0]);
+    } else if (command === "sh" || command === "ssh") {
+      await shell(args);
     } else if (command === "run") {
       await runInTask(args[0], args.slice(1));
     } else if (command === "stop") {
