@@ -991,48 +991,37 @@ mod test {
         );
     }
 
-    /// Regression test: TypeScript's `moduleResolution: "nodenext"` requires
-    /// explicit `.js` extensions in source (e.g.
-    /// `import { x } from "test/factories/foo.js"`) even though the on-disk
-    /// file is `foo.ts`. The resolver must apply TypeScript's standard
-    /// extension rewriting (`.js` → `.ts`/`.tsx`) so that tsconfig `paths`
-    /// aliases resolve correctly — otherwise the import falls through to
-    /// `check_package_import` and is incorrectly flagged as an undeclared
-    /// dependency.
-    ///
-    /// See: <https://github.com/vercel/turborepo/issues/11906>
-    #[test]
-    fn tsconfig_alias_resolves_js_extension_to_ts_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Canonicalize to match the resolver's symlink-resolved paths
-        // (e.g. /tmp → /private/tmp on macOS). Uses dunce to avoid
-        // \\?\ prefix on Windows which breaks path comparison.
-        let root = dunce::canonicalize(tmp.path()).unwrap();
+    #[test_case("test/*", "./test/*", "test/factories/item.factory.ts", "test/factories/item.factory.js" ; "js to ts")]
+    #[test_case("@/*", "./src/*", "src/helper.mts", "@/helper.mjs" ; "mjs to mts")]
+    #[test_case("@/*", "./src/*", "src/helper.cts", "@/helper.cjs" ; "cjs to cts")]
+    fn tsconfig_alias_resolves_typescript_extension_aliases(
+        alias_key: &str,
+        alias_target: &str,
+        target_file: &str,
+        import: &str,
+    ) {
+        let tmp = tempfile::tempdir().expect("create temp project");
+        let root = dunce::canonicalize(tmp.path()).expect("canonicalize temp project");
 
-        // Mimic the biz-enrich-service layout from the reproduction: an ESM
-        // TypeScript project with a tsconfig path alias (`test/*`) whose
-        // target files are `.ts` on disk but imported with `.js`.
         let tsconfig = root.join("tsconfig.json");
-        std::fs::write(
-            &tsconfig,
-            r#"{ "compilerOptions": { "paths": { "test/*": ["./test/*"] } } }"#,
-        )
-        .unwrap();
+        let tsconfig_content = format!(
+            r#"{{ "compilerOptions": {{ "module": "nodenext", "moduleResolution": "nodenext", "paths": {{ "{alias_key}": ["{alias_target}"] }} }} }}"#
+        );
+        std::fs::write(&tsconfig, tsconfig_content).expect("write tsconfig");
 
-        std::fs::create_dir_all(root.join("test").join("factories")).unwrap();
-        std::fs::write(
-            root.join("test").join("factories").join("item.factory.ts"),
-            "export const item = {};",
-        )
-        .unwrap();
+        let target_path = root.join(target_file);
+        std::fs::create_dir_all(target_path.parent().expect("target file has parent"))
+            .expect("create target directory");
+        std::fs::write(&target_path, "export const x = 1;").expect("write target file");
 
-        // Source file imports with an explicit `.js` extension (required by
-        // nodenext ESM) that must be rewritten to `.ts` by the resolver.
-        let file_content = r#"import { item } from "test/factories/item.factory.js";"#;
-        std::fs::write(root.join("index.ts"), file_content).unwrap();
+        let file_content = format!(r#"import {{ x }} from "{import}";"#);
+        std::fs::write(root.join("index.ts"), &file_content).expect("write source file");
 
-        let package_root = AbsoluteSystemPath::new(root.to_str().unwrap()).unwrap();
-        let tsconfig_path = AbsoluteSystemPath::new(tsconfig.to_str().unwrap()).unwrap();
+        let package_root = AbsoluteSystemPath::new(root.to_str().expect("root path is utf-8"))
+            .expect("root path is absolute");
+        let tsconfig_path =
+            AbsoluteSystemPath::new(tsconfig.to_str().expect("tsconfig path is utf-8"))
+                .expect("tsconfig path is absolute");
         let file_path = package_root.join_component("index.ts");
         let package_name = PackageName::from("test-pkg");
         let span = SourceSpan::new(0.into(), 0);
@@ -1045,63 +1034,14 @@ mod test {
             package_root,
             span,
             &file_path,
-            file_content,
-            "test/factories/item.factory.js",
+            &file_content,
+            import,
         )
-        .unwrap();
+        .expect("check tsconfig path alias");
 
         assert!(
             resolved,
-            "test/factories/item.factory.js should resolve to item.factory.ts via a tsconfig path \
-             alias"
-        );
-        assert!(
-            diag.is_none(),
-            "expected no boundary violations for a locally-aliased nodenext ESM import"
-        );
-    }
-
-    /// Same as above but for `.mjs` → `.mts` rewriting.
-    #[test]
-    fn tsconfig_alias_resolves_mjs_extension_to_mts_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = dunce::canonicalize(tmp.path()).unwrap();
-
-        let tsconfig = root.join("tsconfig.json");
-        std::fs::write(
-            &tsconfig,
-            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
-        )
-        .unwrap();
-
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src").join("helper.mts"), "export const x = 1;").unwrap();
-
-        let file_content = r#"import { x } from "@/helper.mjs";"#;
-        std::fs::write(root.join("index.ts"), file_content).unwrap();
-
-        let package_root = AbsoluteSystemPath::new(root.to_str().unwrap()).unwrap();
-        let tsconfig_path = AbsoluteSystemPath::new(tsconfig.to_str().unwrap()).unwrap();
-        let file_path = package_root.join_component("index.ts");
-        let package_name = PackageName::from("test-pkg");
-        let span = SourceSpan::new(0.into(), 0);
-
-        let resolver = Tracer::create_resolver(Some(tsconfig_path));
-
-        let (resolved, diag) = check_import_as_tsconfig_path_alias(
-            &resolver,
-            &package_name,
-            package_root,
-            span,
-            &file_path,
-            file_content,
-            "@/helper.mjs",
-        )
-        .unwrap();
-
-        assert!(
-            resolved,
-            "@/helper.mjs should resolve to helper.mts via extension alias"
+            "{import} should resolve through the tsconfig alias"
         );
         assert!(diag.is_none());
     }

@@ -260,32 +260,27 @@ jobs:
           cd cli && make stage-release
           echo "stage-branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
 
-  # TODO: Re-enable Rust unit tests once flakiness is resolved.
-  # rust-smoke-test:
-  #   name: Rust Unit Tests
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 30
-  #   needs: [stage]
-  #   if: ${{ always() && needs.stage.result == 'success' }}
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         ref: ${{ needs.stage.outputs.stage-branch }}
-  #
-  #     - name: Setup Environment
-  #       uses: ./.github/actions/setup-environment
-  #       with:
-  #         github-token: ${{ secrets.GITHUB_TOKEN }}
-  #         node: "false"
-  #
-  #     - name: Install cargo-nextest
-  #       uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532
-  #       with:
-  #         tool: nextest
-  #
-  #     - name: Run tests
-  #       timeout-minutes: 30
-  #       run: cargo nextest run --workspace
+  rust-smoke-test:
+    name: Rust Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [stage]
+    if: ${{ always() && needs.stage.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.stage.outputs.stage-branch }}
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-environment
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          node: "false"
+          capnproto: "false"
+
+      - name: Run tests
+        timeout-minutes: 20
+        run: cargo test -p turbo-trace -p turborepo-boundaries
 
   js-smoke-test:
     name: JS Package Tests
@@ -383,9 +378,8 @@ jobs:
     name: "Publish To NPM"
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # TODO: Add rust-smoke-test back to needs and if-condition when re-enabled.
-    needs: [stage, build-rust, js-smoke-test]
-    if: ${{ always() && needs.stage.result == 'success' && needs.build-rust.result == 'success' && needs.js-smoke-test.result == 'success' }}
+    needs: [stage, rust-smoke-test, build-rust, js-smoke-test]
+    if: ${{ always() && needs.stage.result == 'success' && needs.rust-smoke-test.result == 'success' && needs.build-rust.result == 'success' && needs.js-smoke-test.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -690,10 +684,10 @@ jobs:
     name: "Cleanup Failed Release"
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # TODO: Add rust-smoke-test back to needs and if-condition when re-enabled.
     needs:
       [
         stage,
+        rust-smoke-test,
         build-rust,
         js-smoke-test,
         npm-publish,
@@ -706,6 +700,7 @@ jobs:
         && needs.stage.result == 'success'
         && (
           needs.build-rust.result == 'failure'
+          || needs.rust-smoke-test.result == 'failure'
           || needs.js-smoke-test.result == 'failure'
           || needs.npm-publish.result == 'failure'
           || needs.create-release-tag.result == 'failure'
