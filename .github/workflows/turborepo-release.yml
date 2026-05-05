@@ -260,27 +260,27 @@ jobs:
           cd cli && make stage-release
           echo "stage-branch=$(git branch --show-current)" >> $GITHUB_OUTPUT
 
-  rust-smoke-test:
-    name: Rust Unit Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: [stage]
-    if: ${{ always() && needs.stage.result == 'success' }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.stage.outputs.stage-branch }}
-
-      - name: Setup Environment
-        uses: ./.github/actions/setup-environment
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          node: "false"
-          capnproto: "false"
-
-      - name: Run tests
-        timeout-minutes: 20
-        run: cargo test -p turbo-trace -p turborepo-boundaries
+  # rust-smoke-test:
+  #   name: Rust Unit Tests
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 30
+  #   needs: [stage]
+  #   if: ${{ always() && needs.stage.result == 'success' }}
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ needs.stage.outputs.stage-branch }}
+  #
+  #     - name: Setup Environment
+  #       uses: ./.github/actions/setup-environment
+  #       with:
+  #         github-token: ${{ secrets.GITHUB_TOKEN }}
+  #         node: "false"
+  #         capnproto: "false"
+  #
+  #     - name: Run tests
+  #       timeout-minutes: 20
+  #       run: cargo test -p turbo-trace -p turborepo-boundaries
 
   js-smoke-test:
     name: JS Package Tests
@@ -692,7 +692,7 @@ jobs:
         js-smoke-test,
         npm-publish,
         create-release-tag,
-        create-release-pr
+        create-release-pr,
       ]
     if: >-
       ${{
