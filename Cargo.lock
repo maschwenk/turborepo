@@ -7803,6 +7803,7 @@ dependencies = [
  "turborepo-vercel-api",
  "turborepo-vercel-api-mock",
  "unrs_resolver",
+ "url",
  "wax",
  "webbrowser",
  "which",
